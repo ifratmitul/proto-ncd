@@ -60,6 +60,7 @@ cifar-10-model/state_dicts/
 # Dataset (will be downloaded)
 data/
 datasets/
+dataset/
 
 # Model outputs
 saved_models/
