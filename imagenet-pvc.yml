@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: imagenet-pvc
+  namespace: longweiwangusd
+spec:
+  storageClassName: rook-cephfs  # Note: Changed from rook-ceph-block to rook-cephfs
+  accessModes:
+    - ReadWriteMany  # Multiple pods can read/write
+  resources:
+    requests:
+      storage: 500Gi  

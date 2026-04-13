@@ -1,0 +1,336 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cb-ncd-cifar100
+  namespace: longweiwangusd
+spec:
+  template:
+    spec:
+      containers:
+      - name: cb-ncd-container
+        image: continuumio/anaconda3:latest
+        command: ["/bin/bash"]
+        args:
+          - "-c"
+          - |
+            set -e
+
+            # GPU Verification
+            echo "=========================================="
+            echo "Verifying GPU availability..."
+            echo "=========================================="
+            sleep 5
+            nvidia-smi || (echo "ERROR: GPU not accessible!" && exit 1)
+
+            export CUDA_DEVICE_ORDER=PCI_BUS_ID
+            export CUDA_VISIBLE_DEVICES=0
+
+            cd /data/CB-NCD
+
+            # Setup environment
+            echo "=========================================="
+            echo "Setting up CB-NCD environment..."
+            echo "=========================================="
+
+            # Initialize conda
+            source /opt/conda/etc/profile.d/conda.sh
+
+            # Check if CB-NCD environment exists, if not run setup script
+
+            echo "Running env-setup.sh..."
+            bash env-setup.sh
+            echo "Environment setup completed via env-setup.sh"
+
+            # Activate CB-NCD environment
+            conda activate CB-NCD
+
+            # Verify installations
+            echo "Verifying installations..."
+            python -c "import torch; assert torch.cuda.is_available(), 'CUDA not available!'; print(f'PyTorch {torch.__version__} with CUDA {torch.version.cuda}')"
+            python -c "import pytorch_lightning as pl; print(f'PyTorch Lightning {pl.__version__}')"
+            python -c "import wandb; print(f'Wandb {wandb.__version__}')"
+            python -c "import clip; print('CLIP loaded successfully')"
+            python -c "import torch; print(f'GPU: {torch.cuda.get_device_name(0)}')"
+
+            # Create directories
+            mkdir -p datasets checkpoints logs/wandb
+
+            # ============================================================
+            # CB-NCD EXPERIMENT: CIFAR-100 (80 labeled + 20 unlabeled classes)
+            # ============================================================
+
+            DATASET="CIFAR100"
+            NUM_LABELED=80
+            NUM_UNLABELED=20
+            COMMENT="cifar100_80_20"
+            ARCH="resnet18"
+
+            echo ""
+            echo "=========================================="
+            echo "EXPERIMENT: CB-NCD on $DATASET ($NUM_LABELED labeled + $NUM_UNLABELED unlabeled)"
+            echo "=========================================="
+            echo ""
+
+            # ============================================================
+            # STAGE 1: PRETRAINING
+            # ============================================================
+
+            PRETRAIN_CHECKPOINT="checkpoints/pretrain-${ARCH}-${DATASET}-${COMMENT}.cp"
+            ENCODER_CHECKPOINT="checkpoints/encoder-${ARCH}-${DATASET}.pth"
+
+            if [ ! -f "$ENCODER_CHECKPOINT" ]; then
+                echo "----------------------------------------"
+                echo "Stage 1: Pretraining on $NUM_LABELED labeled classes"
+                echo "----------------------------------------"
+                echo "Parameters:"
+                echo "  - Dataset: $DATASET"
+                echo "  - Labeled classes: $NUM_LABELED"
+                echo "  - Unlabeled classes: $NUM_UNLABELED"
+                echo "  - Epochs: 200"
+                echo "  - Batch size: 256"
+                echo "  - Architecture: $ARCH"
+                echo ""
+
+                python main_pretrain.py \
+                    --dataset $DATASET \
+                    --num_labeled_classes $NUM_LABELED \
+                    --num_unlabeled_classes $NUM_UNLABELED \
+                    --devices 1 \
+                    --accelerator gpu \
+                    --precision 16 \
+                    --max_epochs 200 \
+                    --batch_size 512 \
+                    --arch $ARCH \
+                    --base_lr 0.1 \
+                    --min_lr 0.001 \
+                    --momentum_opt 0.9 \
+                    --weight_decay_opt 1.0e-4 \
+                    --warmup_epochs 10 \
+                    --temperature 0.1 \
+                    --comment "$COMMENT" \
+                    --data_dir datasets \
+                    --checkpoint_dir checkpoints \
+                    --log_dir logs \
+                    --project CB-NCD \
+                    --entity ifrat-ikhtear-university-of-south-dakota \
+                    --download
+
+                echo ""
+                echo "Pretraining completed!"
+                echo "Checkpoint saved to: $PRETRAIN_CHECKPOINT"
+                echo "Encoder saved to: $ENCODER_CHECKPOINT"
+                echo ""
+            else
+                echo "Pretrained encoder already exists: $ENCODER_CHECKPOINT"
+                echo "Skipping pretraining stage..."
+                echo ""
+            fi
+
+            # ============================================================
+            # STAGE 2: TRAIN CONCEPT LAYER
+            # ============================================================
+
+            CONCEPT_SET="concept-data/concept_sets/cifar100_filtered.txt"
+            CONCEPT_CHECKPOINT="checkpoints/concept_layer-${ARCH}-${DATASET}-${COMMENT}.pth"
+
+            if [ ! -f "$CONCEPT_CHECKPOINT" ]; then
+                echo "----------------------------------------"
+                echo "Stage 2: Training Concept Layer"
+                echo "----------------------------------------"
+                echo "Parameters:"
+                echo "  - Pretrained encoder: $ENCODER_CHECKPOINT"
+                echo "  - Concept set: $CONCEPT_SET"
+                echo "  - Iterations: 1000"
+                echo "  - Batch size: 256"
+                echo "  - CLIP cutoff: 0.25"
+                echo "  - Patience: 5 validation checks"
+                echo ""
+
+                python train_concept_layer.py \
+                    --pretrained_encoder "$ENCODER_CHECKPOINT" \
+                    --concept_set "$CONCEPT_SET" \
+                    --dataset $DATASET \
+                    --num_labeled_classes $NUM_LABELED \
+                    --num_unlabeled_classes $NUM_UNLABELED \
+                    --arch $ARCH \
+                    --n_iters 1000 \
+                    --batch_size 256 \
+                    --proj_batch_size 50000 \
+                    --clip_cutoff 0.35 \
+                    --patience 5 \
+                    --comment "$COMMENT" \
+                    --data_dir datasets \
+                    --checkpoint_dir checkpoints \
+                    --num_workers 8 \
+                    --log_dir logs \
+                    --project CB-NCD \
+                    --entity ifrat-ikhtear-university-of-south-dakota
+
+                echo ""
+                echo "Concept layer training completed!"
+                echo "Checkpoint saved to: $CONCEPT_CHECKPOINT"
+                echo ""
+            else
+                echo "Concept layer checkpoint already exists: $CONCEPT_CHECKPOINT"
+                echo "Skipping concept layer training..."
+                echo ""
+            fi
+
+            # ============================================================
+            # STAGE 3: DISCOVERY (CB-NCD)
+            # ============================================================
+
+            DISCOVERY_CHECKPOINT="checkpoints/discover-CB-NCD-${ARCH}-${DATASET}-${COMMENT}_cbncd-final.pth"
+
+            if [ ! -f "$DISCOVERY_CHECKPOINT" ]; then
+                echo "----------------------------------------"
+                echo "Stage 3: Novel Class Discovery (CB-NCD)"
+                echo "----------------------------------------"
+                echo "Parameters:"
+                echo "  - Dataset: $DATASET"
+                echo "  - Labeled classes: $NUM_LABELED"
+                echo "  - Unlabeled classes: $NUM_UNLABELED"
+                echo "  - Epochs: 200"
+                echo "  - Batch size: 256"
+                echo "  - Number of heads: 4"
+                echo "  - Overcluster factor: 3"
+                echo "  - Base LR: 0.1"
+                echo "  - Concept LR: 0.01 (W_c fine-tuning)"
+                echo "  - Lambda sparse: 0.0"
+                echo "  - Lambda intra: 0.0"
+                echo "  - Pretrained checkpoint: $PRETRAIN_CHECKPOINT"
+                echo "  - Concept checkpoint: $CONCEPT_CHECKPOINT"
+                echo ""
+
+                python main_discover.py \
+                    --dataset $DATASET \
+                    --pretrained "$PRETRAIN_CHECKPOINT" \
+                    --concept_checkpoint "$CONCEPT_CHECKPOINT" \
+                    --num_labeled_classes $NUM_LABELED \
+                    --num_unlabeled_classes $NUM_UNLABELED \
+                    --lambda_sparse 0 \
+                    --lambda_intra 0 \
+                    --devices 1 \
+                    --accelerator gpu \
+                    --precision 16 \
+                    --max_epochs 250 \
+                    --batch_size 512 \
+                    --arch $ARCH \
+                    --base_lr 0.1 \
+                    --concept_lr 0.01 \
+                    --min_lr 0.001 \
+                    --momentum_opt 0.9 \
+                    --weight_decay_opt 1.5e-4 \
+                    --warmup_epochs 20 \
+                    --proj_dim 256 \
+                    --hidden_dim 2048 \
+                    --overcluster_factor 3 \
+                    --num_heads 4 \
+                    --num_hidden_layers 1 \
+                    --num_iters_sk 3 \
+                    --epsilon_sk 0.05 \
+                    --temperature 0.1 \
+                    --comment "${COMMENT}_cbncd" \
+                    --data_dir datasets \
+                    --log_dir logs \
+                    --project CB-NCD \
+                    --entity ifrat-ikhtear-university-of-south-dakota \
+                    --num_workers 10
+
+                echo ""
+                echo "CB-NCD Discovery phase completed!"
+                echo ""
+            else
+                echo "Discovery checkpoint already exists: $DISCOVERY_CHECKPOINT"
+                echo "Skipping discovery stage..."
+                echo ""
+            fi
+
+            # ============================================================
+            # SYNC RESULTS TO WANDB
+            # ============================================================
+
+            echo "=========================================="
+            echo "Syncing results to Wandb..."
+            echo "=========================================="
+
+            # Sync all offline runs
+            if [ -d "logs/wandb" ]; then
+                for run_dir in logs/wandb/offline-run-*; do
+                    if [ -d "$run_dir" ]; then
+                        echo "Syncing: $run_dir"
+                        wandb sync "$run_dir" \
+                            --project CB-NCD \
+                            --entity ifrat-ikhtear-university-of-south-dakota || \
+                            echo "Warning: Failed to sync $run_dir"
+                    fi
+                done
+            fi
+
+            echo ""
+            echo "Wandb sync completed!"
+            echo ""
+
+            # ============================================================
+            # SUMMARY
+            # ============================================================
+
+            echo "=========================================="
+            echo "CB-NCD EXPERIMENT COMPLETED SUCCESSFULLY!"
+            echo "=========================================="
+            echo ""
+            echo "Configuration:"
+            echo "  - Dataset: $DATASET"
+            echo "  - Labeled classes: $NUM_LABELED"
+            echo "  - Unlabeled classes: $NUM_UNLABELED"
+            echo "  - Stage 1 (Pretrain): 200 epochs"
+            echo "  - Stage 2 (Concepts): 1000 iters"
+            echo "  - Stage 3 (Discovery): 200 epochs"
+            echo ""
+            echo "Outputs:"
+            echo "  - Checkpoints: /data/CB-NCD/checkpoints/"
+            echo "  - Logs: /data/CB-NCD/logs/"
+            echo "  - Wandb Project: https://wandb.ai/ifrat-ikhtear-university-of-south-dakota/CB-NCD"
+            echo ""
+
+            # List generated files
+            echo "Generated files:"
+            echo ""
+            echo "Checkpoints:"
+            ls -lh checkpoints/*.cp checkpoints/*.pth 2>/dev/null || echo "  No checkpoints found"
+            echo ""
+
+            echo "=========================================="
+            echo "View detailed results at:"
+            echo "https://wandb.ai/ifrat-ikhtear-university-of-south-dakota/CB-NCD"
+            echo "=========================================="
+            echo ""
+            echo "Job finished!"
+
+        volumeMounts:
+        - name: data-storage
+          mountPath: /data
+        - name: dshm
+          mountPath: /dev/shm
+        resources:
+          requests:
+            memory: "32Gi"
+            cpu: "4"
+            nvidia.com/rtxa6000: 1
+          limits:
+            memory: "64Gi"
+            cpu: "6"
+            nvidia.com/rtxa6000: 1
+        env:
+        - name: WANDB_API_KEY
+          value: "e4fd4574750e8643d302b6ad2129f6b89790fa87"
+      volumes:
+      - name: data-storage
+        persistentVolumeClaim:
+          claimName: vindr-cxr-pvc
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: "16Gi"
+      restartPolicy: Never
+  backoffLimit: 0

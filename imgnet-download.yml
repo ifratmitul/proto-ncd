@@ -1,0 +1,28 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: data-download
+  namespace: longweiwangusd
+spec:
+  template:
+    spec:
+      containers:
+      - name: download-container
+        image: ubuntu
+        command: ["sh","-c"]
+        args: ["apt-get update; apt-get -y install curl; curl -o /data/ILSVRC2012_img_val.tar  https://www.image-net.org/data/ILSVRC/2012/ILSVRC2012_img_val.tar; curl -o /data/ILSVRC2012_img_train.tar  https://www.image-net.org/data/ILSVRC/2012/ILSVRC2012_img_train.tar; apt-get update; apt-get -y install wget; cd /data; mkdir train && mv ILSVRC2012_img_train.tar train/ && cd train && tar -xvf ILSVRC2012_img_train.tar && rm -f ILSVRC2012_img_train.tar && find . -name \"*.tar\" | while read NAME; do mkdir -p \"${NAME%.tar}\"; tar -xvf \"${NAME}\" -C \"${NAME%.tar}\"; rm -f \"${NAME}\"; done && cd .. && mkdir val && mv ILSVRC2012_img_val.tar val/ && cd val && tar -xvf ILSVRC2012_img_val.tar && wget -qO- https://raw.githubusercontent.com/soumith/imagenetloader.torch/master/valprep.sh | bash"]
+        resources:      
+          requests:
+            memory: 16Gi
+            cpu: "8"
+          limits:
+            memory: 16Gi
+            cpu: "8"
+        volumeMounts:
+        - name: vol
+          mountPath: /data
+      restartPolicy: Never
+      volumes: 
+      - name: vol
+        persistentVolumeClaim:
+          claimName: imagenet-pvc
